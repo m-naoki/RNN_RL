@@ -14,7 +14,7 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for TD3 agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim):
+    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, device):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
@@ -28,6 +28,7 @@ class ReplayBuffer:
             
         self.ptr, self.size, self.max_size = 0, 0, size
         self.recurrent = recurrent
+        self.device = device
 
     def store(self, obs, act, rew, next_obs, done, hidden, next_hidden):
         self.obs_buf[self.ptr] = obs
@@ -60,9 +61,11 @@ class ReplayBuffer:
                                 c=self.c_buf[idxs][None,:],
                                 h2=self.h2_buf[idxs][None,:],
                                 c2=self.c2_buf[idxs][None,:]))
-            batch = {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+            batch = {k: torch.as_tensor(
+                v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
         else:
-            batch = {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+            batch = {k: torch.as_tensor(
+                v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
             # add None after conversion
             batch.update(dict(h=None, 
                                 c=None, 
@@ -77,7 +80,7 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
         polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
         noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
-        recurrent=True, hidden_dim=256, logger_kwargs=dict(), save_freq=1):
+        recurrent=True, hidden_dim=256, device='cuda', logger_kwargs=dict(), save_freq=1):
     """
     Twin Delayed Deep Deterministic Policy Gradient (TD3)
 
@@ -191,8 +194,9 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
 
     # Create actor-critic module and target networks
     ac = actor_critic(env.observation_space, env.action_space, 
-                        recurrent, hidden_dim=hidden_dim, **ac_kwargs)
-    ac_targ = deepcopy(ac)
+                        recurrent, hidden_dim=hidden_dim, 
+                        device=device, **ac_kwargs).to(device)
+    ac_targ = deepcopy(ac).to(device)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
     for p in ac_targ.parameters():
@@ -202,7 +206,7 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, hidden_dim)
+    replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, hidden_dim, device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
@@ -237,8 +241,8 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach().numpy(),
-                         Q2Vals=q2.detach().numpy())
+        loss_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                         Q2Vals=q2.detach().cpu().numpy())
 
         return loss_q, loss_info
 
@@ -296,7 +300,7 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
                     p_targ.data.add_((1 - polyak) * p.data)
 
     def get_action(o, hidden, noise_scale):
-        o = torch.as_tensor(o, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        o = torch.as_tensor(o, dtype=torch.float32).to(device).unsqueeze(0).unsqueeze(0)
         a, hidden = ac.act(o, hidden)
         a = a.squeeze(0).squeeze(0)
         a += noise_scale * np.random.randn(act_dim)
@@ -395,6 +399,8 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='td3')
     parser.add_argument('--recurrent', type=bool, default=True)
+    parser.add_argument('--device', type=str, 
+        default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
@@ -403,4 +409,5 @@ if __name__ == '__main__':
     td3(lambda : gym.make(args.env), actor_critic=core.ActorCritic,
         ac_kwargs=dict(), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        recurrent = args.recurrent, hidden_dim=args.hid, logger_kwargs=logger_kwargs)
+        recurrent = args.recurrent, hidden_dim=args.hid, 
+        device=args.device, logger_kwargs=logger_kwargs)

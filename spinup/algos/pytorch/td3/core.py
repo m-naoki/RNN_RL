@@ -67,7 +67,7 @@ class QFunction(nn.Module):
 
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space, recurrent, hidden_dim=256,
-                 activation=nn.ReLU):
+                 activation=nn.ReLU, device='cuda'):
         super().__init__()
 
         obs_dim = observation_space.shape[0]
@@ -79,11 +79,12 @@ class ActorCritic(nn.Module):
         self.q1 = QFunction(obs_dim, act_dim, hidden_dim, activation, recurrent)
         self.q2 = QFunction(obs_dim, act_dim, hidden_dim, activation, recurrent)
         self.recurrent = recurrent
+        self.device = device
 
     def act(self, obs, hidden):
         with torch.no_grad():
             act, hidden = self.pi(obs, hidden)
-            return act.numpy(), hidden
+            return act.cpu().numpy(), hidden
 
     def get_initialized_hidden(self):
         h_0, c_0 = None, None
@@ -92,13 +93,13 @@ class ActorCritic(nn.Module):
                 self.pi.l1.num_layers,
                 1,
                 self.pi.l1.hidden_size),
-                dtype=torch.float)
+                dtype=torch.float).to(self.device)
             h_0 = h_0
 
             c_0 = torch.zeros((
                 self.pi.l1.num_layers,
                 1,
                 self.pi.l1.hidden_size),
-                dtype=torch.float)
+                dtype=torch.float).to(self.device)
             c_0 = c_0
         return (h_0, c_0)
