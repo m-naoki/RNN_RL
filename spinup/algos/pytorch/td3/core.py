@@ -1,3 +1,5 @@
+from locale import currency
+from multiprocessing.dummy import current_process
 import numpy as np
 import scipy.signal
 
@@ -10,41 +12,61 @@ def combined_shape(length, shape=None):
         return (length,)
     return (length, shape) if np.isscalar(shape) else (length, *shape)
 
-def mlp(sizes, activation, output_activation=nn.Identity):
-    layers = []
-    for j in range(len(sizes)-1):
-        act = activation if j < len(sizes)-2 else output_activation
-        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
-    return nn.Sequential(*layers)
-
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
 
-class MLPActor(nn.Module):
-
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
+class Actor(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_dim, activation, act_limit, recurrent):
         super().__init__()
-        pi_sizes = [obs_dim] + list(hidden_sizes) + [act_dim]
-        self.pi = mlp(pi_sizes, activation, nn.Tanh)
         self.act_limit = act_limit
+        self.recurrent = recurrent
+        self.activation = activation()
+        self.tanh = nn.Tanh()
+        if recurrent:
+            self.l1 = nn.LSTM(obs_dim, hidden_dim, batch_first=True)
+        else:
+            self.l1 = nn.Linear(obs_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, act_dim)
+        
+    def forward(self, obs, hidden):
+        if self.recurrent:
+            self.l1.flatten_parameters()
+            a, hidden = self.l1(obs, hidden)
+        else:
+            a, hidden = self.activation(self.l1(obs)), None
 
-    def forward(self, obs):
-        # Return output from network scaled to action space limits.
-        return self.act_limit * self.pi(obs)
+        a = self.activation(self.l2(a))
+        a = self.tanh(self.l3(a))
 
-class MLPQFunction(nn.Module):
+        return self.act_limit * a, hidden
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+class QFunction(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_dim, activation, recurrent):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+        self.recurrent = recurrent
+        self.activation = activation()
+        if self.recurrent:
+            self.l1 = nn.LSTM(obs_dim+act_dim, hidden_dim, batch_first=True)
+        else:
+            self.l1 = nn.Linear(obs_dim + act_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, obs, act):
-        q = self.q(torch.cat([obs, act], dim=-1))
-        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+    def forward(self, obs, act, hidden):
+        obs_act = torch.cat([obs, act], dim=-1)
+        if self.recurrent:
+            self.l1.flatten_parameters()
+            q, hidden = self.l1(obs_act, hidden)
+        else:
+            q, hidden = self.activation(self.l1(obs_act)), None
 
-class MLPActorCritic(nn.Module):
+        q = self.activation(self.l2(q))
+        q = self.l3(q)
+        return q.squeeze(-1).squeeze(-1) # Critical to ensure q has right shape.
 
-    def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
+class ActorCritic(nn.Module):
+    def __init__(self, observation_space, action_space, recurrent, hidden_dim=256,
                  activation=nn.ReLU):
         super().__init__()
 
@@ -53,10 +75,30 @@ class MLPActorCritic(nn.Module):
         act_limit = action_space.high[0]
 
         # build policy and value functions
-        self.pi = MLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
-        self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
-        self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+        self.pi = Actor(obs_dim, act_dim, hidden_dim, activation, act_limit, recurrent)
+        self.q1 = QFunction(obs_dim, act_dim, hidden_dim, activation, recurrent)
+        self.q2 = QFunction(obs_dim, act_dim, hidden_dim, activation, recurrent)
+        self.recurrent = recurrent
 
-    def act(self, obs):
+    def act(self, obs, hidden):
         with torch.no_grad():
-            return self.pi(obs).numpy()
+            act, hidden = self.pi(obs, hidden)
+            return act.numpy(), hidden
+
+    def get_initialized_hidden(self):
+        h_0, c_0 = None, None
+        if self.recurrent:
+            h_0 = torch.zeros((
+                self.pi.l1.num_layers,
+                1,
+                self.pi.l1.hidden_size),
+                dtype=torch.float)
+            h_0 = h_0
+
+            c_0 = torch.zeros((
+                self.pi.l1.num_layers,
+                1,
+                self.pi.l1.hidden_size),
+                dtype=torch.float)
+            c_0 = c_0
+        return (h_0, c_0)
