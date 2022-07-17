@@ -325,9 +325,11 @@ class EpochLogger(Logger):
     to record the desired values.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, tb_writer, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.epoch_dict = dict()
+        self.tb_writer = tb_writer
+        self.epoch = 0
 
     def store(self, **kwargs):
         """
@@ -362,16 +364,21 @@ class EpochLogger(Logger):
         """
         if val is not None:
             super().log_tabular(key,val)
+            self.tb_writer.add_scalar(key, val, self.epoch)
         else:
             v = self.epoch_dict[key]
             vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = mpi_statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            self.tb_writer.add_scalar(key if average_only else 'Average' + key, stats[0], self.epoch)
             if not(average_only):
                 super().log_tabular('Std'+key, stats[1])
+                self.tb_writer.add_scalar('Std'+key, stats[1], self.epoch)
             if with_min_and_max:
                 super().log_tabular('Max'+key, stats[3])
+                self.tb_writer.add_scalar('Max'+key, stats[3], self.epoch)
                 super().log_tabular('Min'+key, stats[2])
+                self.tb_writer.add_scalar('Min'+key, stats[2], self.epoch)
         self.epoch_dict[key] = []
 
     def get_stats(self, key):
@@ -381,3 +388,7 @@ class EpochLogger(Logger):
         v = self.epoch_dict[key]
         vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
         return mpi_statistics_scalar(vals)
+
+    def update_epoch(self, epoch):
+        self.log_tabular('Epoch', epoch)
+        self.epoch = epoch

@@ -3,6 +3,7 @@ import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
+from torch.utils.tensorboard import SummaryWriter
 import gym
 import time
 import spinup.algos.pytorch.td3.core as core
@@ -179,7 +180,9 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
 
     """
 
-    logger = EpochLogger(**logger_kwargs)
+    # record values to tensorboard when method log_tabular is called
+    writer = SummaryWriter(log_dir=logger_kwargs['output_dir'])
+    logger = EpochLogger(writer, **logger_kwargs)
     logger.save_config(locals())
 
     torch.manual_seed(seed)
@@ -376,7 +379,7 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
             test_agent()
 
             # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
+            logger.update_epoch(epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
             logger.log_tabular('TestEpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
