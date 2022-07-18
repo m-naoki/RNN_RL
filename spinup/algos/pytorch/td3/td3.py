@@ -17,7 +17,7 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for TD3 agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, sequence_length, device):
+    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, n_sequence, n_burn_in, device):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
@@ -31,7 +31,8 @@ class ReplayBuffer:
             
         self.ptr, self.size, self.max_size = 0, 0, size
         self.recurrent = recurrent
-        self.sequence_length = sequence_length
+        self.n_sequence = n_sequence
+        self.n_burn_in = n_burn_in
         self.device = device
 
     def store(self, obs, act, rew, next_obs, done, hidden, next_hidden):
@@ -54,46 +55,70 @@ class ReplayBuffer:
 
     def sample_batch(self, batch_size=32):
         if self.recurrent:
-            # Avoid Done is in 0~n-1 of sequence
+            burn_in_idxs = []
             idxs = []
             for _ in range(batch_size):
                 done_included = True
                 while done_included:
                    idx = np.random.randint(0, self.size)
-                   done_included = self.done_buf[idx:idx + self.sequence_length - 1].sum() > 0.0
-                idxs.append(np.arange(idx, idx+self.sequence_length)[None,:])
+                   # Avoid Done is in 0~n-1 of total sequence length
+                   done_included = self.done_buf[
+                       idx:idx + self.n_burn_in + self.n_sequence - 1].sum() > 0.0
+                burn_in_idxs.append(np.arange(idx, idx+self.n_burn_in)[None,:])
+                idxs.append(np.arange(
+                    idx+self.n_burn_in, idx+self.n_burn_in+self.n_sequence)[None,:])
+            
             # Shape (batch_size, sequence_length)
+            burn_in_idxs = np.concatenate(burn_in_idxs, 0)
             idxs = np.concatenate(idxs, 0)
 
-            # Shape (batch_size, step_length, vector_dim)
-            batch = dict(obs=self.obs_buf[idxs],
-                         obs2=self.obs2_buf[idxs],
-                         act=self.act_buf[idxs],
-                         rew=self.rew_buf[idxs],
-                         done=self.done_buf[idxs],
-                         # Take only initial hidden state
-                         # Shape (1, batch_size, hidden_dim)
-                         h=self.h_buf[idxs[:,0]][None,:],
-                         c=self.c_buf[idxs[:,0]][None,:],
-                         h2=self.h2_buf[idxs[:,0]][None,:],
-                         c2=self.c2_buf[idxs[:,0]][None,:])
+            batch = dict(
+                # Shape (batch_size, step_length, vector_dim)
+                obs=self.obs_buf[idxs],
+                obs2=self.obs2_buf[idxs],
+                act=self.act_buf[idxs],
+                rew=self.rew_buf[idxs],
+                done=self.done_buf[idxs],
+                )
+            if self.n_burn_in > 0:
+                batch.update(
+                    b_obs=self.obs_buf[burn_in_idxs],
+                    b_obs2=self.obs2_buf[burn_in_idxs],
+                    b_act=self.act_buf[burn_in_idxs],
+                    # Shape (1, batch_size, hidden_dim)    
+                    b_h=self.h_buf[burn_in_idxs[:,0]][None,:],
+                    b_c=self.c_buf[burn_in_idxs[:,0]][None,:],
+                    b_h2=self.h2_buf[burn_in_idxs[:,0]][None,:],
+                    b_c2=self.c2_buf[burn_in_idxs[:,0]][None,:]
+                    )
+            else:
+                batch.update(
+                    # Shape (1, batch_size, hidden_dim)    
+                    h=self.h_buf[idxs[:,0]][None,:],
+                    c=self.c_buf[idxs[:,0]][None,:],
+                    h2=self.h2_buf[idxs[:,0]][None,:],
+                    c2=self.c2_buf[idxs[:,0]][None,:]
+                )
             batch = {k: torch.as_tensor(
-                v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
+                v, dtype=torch.float32).to(self.device) 
+                if v is not None else v for k,v in batch.items()}
         else:
             idxs = np.random.randint(0, self.size, size=batch_size)
             # Shape is (batch_size, vector_dim)
-            batch = dict(obs=self.obs_buf[idxs],
-                         obs2=self.obs2_buf[idxs],
-                         act=self.act_buf[idxs],
-                         rew=self.rew_buf[idxs],
-                         done=self.done_buf[idxs])
+            batch = dict(
+                        obs=self.obs_buf[idxs],
+                        obs2=self.obs2_buf[idxs],
+                        act=self.act_buf[idxs],
+                        rew=self.rew_buf[idxs],
+                        done=self.done_buf[idxs],
+                        h=None, 
+                        c=None, 
+                        h2=None,
+                        c2=None)
             batch = {k: torch.as_tensor(
-                v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
-            # Add None after conversion for torch tensor
-            batch.update(dict(h=None, 
-                              c=None, 
-                              h2=None,
-                              c2=None))
+                v, dtype=torch.float32).to(self.device) 
+                if v is not None else v for k,v in batch.items()}
+        
         return batch
 
 
@@ -232,13 +257,26 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
-    sample_length = n_sequence + n_burn_in
     replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, 
-                                 hidden_dim, sample_length, device)
+                                 hidden_dim, n_sequence, n_burn_in, device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
     logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+
+    def burn_in(data):
+        b_o, b_a, b_o2 = data['b_obs'], data['b_act'],  data['b_obs2']
+        b_h, b_c, b_h2, b_c2 = data['b_h'], data['b_c'], data['b_h2'], data['b_c2']
+        with torch.no_grad():
+            # return last hidden state
+            _, hidden = ac.pi(b_o, (b_h, b_c))
+            _, hidden_targ = ac_targ.pi(b_o2, (b_h2, b_c2))
+            h, c = hidden
+            h2, c2 = hidden_targ
+
+        data['h'], data['c'] = h.detach(), c.detach()
+        data['h2'], data['c2'] = h2.detach(), c2.detach()
+        return data
 
     # Set up function for computing TD3 Q-losses
     def compute_loss_q(data):
@@ -289,6 +327,10 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     logger.setup_pytorch_saver(ac)
 
     def update(data, timer):
+        if recurrent and n_burn_in > 0:
+            # hidden state after burn-in is added
+            data = burn_in(data)
+
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, loss_info = compute_loss_q(data)
