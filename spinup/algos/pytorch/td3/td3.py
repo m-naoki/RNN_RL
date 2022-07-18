@@ -1,5 +1,7 @@
+from ast import arg
 from copy import deepcopy
 import itertools
+from re import A
 import numpy as np
 import torch
 from torch.optim import Adam
@@ -15,7 +17,7 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for TD3 agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, device):
+    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, sequence_length, device):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
@@ -29,6 +31,7 @@ class ReplayBuffer:
             
         self.ptr, self.size, self.max_size = 0, 0, size
         self.recurrent = recurrent
+        self.sequence_length = sequence_length
         self.device = device
 
     def store(self, obs, act, rew, next_obs, done, hidden, next_hidden):
@@ -50,28 +53,47 @@ class ReplayBuffer:
         self.size = min(self.size+1, self.max_size)
 
     def sample_batch(self, batch_size=32):
-        idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = dict(obs=self.obs_buf[idxs][:,None],
-                     obs2=self.obs2_buf[idxs][:,None],
-                     act=self.act_buf[idxs][:,None],
-                     rew=self.rew_buf[idxs],
-                     done=self.done_buf[idxs])
         if self.recurrent:
-            # add values before conversion
-            batch.update(dict(h=self.h_buf[idxs][None,:],
-                                c=self.c_buf[idxs][None,:],
-                                h2=self.h2_buf[idxs][None,:],
-                                c2=self.c2_buf[idxs][None,:]))
+            # Avoid Done is in 0~n-1 of sequence
+            idxs = []
+            for _ in range(batch_size):
+                done_included = True
+                while done_included:
+                   idx = np.random.randint(0, self.size)
+                   done_included = self.done_buf[idx:idx + self.sequence_length - 1].sum() > 0.0
+                idxs.append(np.arange(idx, idx+self.sequence_length)[None,:])
+            # Shape (batch_size, sequence_length)
+            idxs = np.concatenate(idxs, 0)
+
+            # Shape (batch_size, step_length, vector_dim)
+            batch = dict(obs=self.obs_buf[idxs],
+                         obs2=self.obs2_buf[idxs],
+                         act=self.act_buf[idxs],
+                         rew=self.rew_buf[idxs],
+                         done=self.done_buf[idxs],
+                         # Take only initial hidden state
+                         # Shape (1, batch_size, hidden_dim)
+                         h=self.h_buf[idxs[:,0]][None,:],
+                         c=self.c_buf[idxs[:,0]][None,:],
+                         h2=self.h2_buf[idxs[:,0]][None,:],
+                         c2=self.c2_buf[idxs[:,0]][None,:])
             batch = {k: torch.as_tensor(
                 v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
         else:
+            idxs = np.random.randint(0, self.size, size=batch_size)
+            # Shape is (batch_size, vector_dim)
+            batch = dict(obs=self.obs_buf[idxs],
+                         obs2=self.obs2_buf[idxs],
+                         act=self.act_buf[idxs],
+                         rew=self.rew_buf[idxs],
+                         done=self.done_buf[idxs])
             batch = {k: torch.as_tensor(
                 v, dtype=torch.float32).to(self.device) for k,v in batch.items()}
-            # add None after conversion
+            # Add None after conversion for torch tensor
             batch.update(dict(h=None, 
-                                c=None, 
-                                h2=None,
-                                c2=None))
+                              c=None, 
+                              h2=None,
+                              c2=None))
         return batch
 
 
@@ -81,7 +103,8 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
         polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
         noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
-        recurrent=True, hidden_dim=256, device='cuda', logger_kwargs=dict(), save_freq=1):
+        recurrent=True, hidden_dim=256, n_burn_in=40, n_sequence=80, n_overlap=40,
+        device='cuda', logger_kwargs=dict(), save_freq=1,):
     """
     Twin Delayed Deep Deterministic Policy Gradient (TD3)
 
@@ -209,7 +232,9 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, hidden_dim, device)
+    sample_length = n_sequence + n_burn_in
+    replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, 
+                                 hidden_dim, sample_length, device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
@@ -391,6 +416,7 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
+    writer.close()
 
 if __name__ == '__main__':
     import argparse
@@ -401,7 +427,10 @@ if __name__ == '__main__':
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='td3')
-    parser.add_argument('--recurrent', type=bool, default=True)
+    parser.add_argument('--recurrent', action='store_true')
+    parser.add_argument('--batch_size', type=int, default=100)
+    parser.add_argument('--n_sequence', type=int, default=80)
+    parser.add_argument('--n_burn_in', type=int, default=40)
     parser.add_argument('--device', type=str, 
         default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
@@ -413,4 +442,6 @@ if __name__ == '__main__':
         ac_kwargs=dict(), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
         recurrent = args.recurrent, hidden_dim=args.hid, 
-        device=args.device, logger_kwargs=logger_kwargs)
+        device=args.device, logger_kwargs=logger_kwargs,
+        batch_size=args.batch_size, n_sequence=args.n_sequence,
+        n_burn_in=args.n_burn_in)
