@@ -17,38 +17,44 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for TD3 agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, n_sequence, n_burn_in, device):
+    def __init__(self, obs_dim, act_dim, size, recurrent, hidden_dim, n_sequence, n_burn_in, net_names, device):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
         if recurrent:
-            self.h_buf = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32)
-            self.c_buf = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32)
-            self.h2_buf = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32)
-            self.c2_buf = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32)
+            self.hidden_buf = {
+                net:dict(
+                    h = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32),
+                    c = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32),
+                    h2 = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32),
+                    c2 = np.zeros(core.combined_shape(size, hidden_dim), dtype=np.float32)
+                )for net in net_names
+            }
             
         self.ptr, self.size, self.max_size = 0, 0, size
         self.recurrent = recurrent
         self.n_sequence = n_sequence
         self.n_burn_in = n_burn_in
+        self.net_names = net_names
         self.device = device
 
-    def store(self, obs, act, rew, next_obs, done, hidden, next_hidden):
+    def store(self, obs, act, rew, next_obs, done, hiddens, next_hiddens):
         self.obs_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
         if self.recurrent:
-            h, c = hidden
-            h2, c2 = next_hidden
-            # Detach the hidden state so that BPTT only goes through 1 timestep
-            self.h_buf[self.ptr] = h.detach().cpu()
-            self.c_buf[self.ptr] = c.detach().cpu()
-            self.h2_buf[self.ptr] = h2.detach().cpu()
-            self.c2_buf[self.ptr] = c2.detach().cpu()
+            for net in self.net_names:
+                h, c = hiddens[net]
+                h2, c2 = next_hiddens[net]
+                # Detach the hidden state so that BPTT only goes through 1 timestep
+                self.hidden_buf[net]['h'][self.ptr] = h.cpu().numpy()
+                self.hidden_buf[net]['c'][self.ptr] = c.cpu().numpy()
+                self.hidden_buf[net]['h2'][self.ptr] = h2.cpu().numpy()
+                self.hidden_buf[net]['c2'][self.ptr] = c2.cpu().numpy()
             
         self.ptr = (self.ptr+1) % self.max_size
         self.size = min(self.size+1, self.max_size)
@@ -60,10 +66,11 @@ class ReplayBuffer:
             for _ in range(batch_size):
                 done_included = True
                 while done_included:
-                   idx = np.random.randint(0, self.size)
-                   # Avoid Done is in 0~n-1 of total sequence length
-                   done_included = self.done_buf[
-                       idx:idx + self.n_burn_in + self.n_sequence - 1].sum() > 0.0
+                    # -1 is for incorporating act2
+                    idx = np.random.randint(0, self.size - self.n_burn_in - self.n_sequence -1)
+                    # Avoid Done is in 0~n-1 of total sequence length
+                    done_included = self.done_buf[
+                        idx:idx + self.n_burn_in + self.n_sequence - 1].sum() > 0.0
                 burn_in_idxs.append(np.arange(idx, idx+self.n_burn_in)[None,:])
                 idxs.append(np.arange(
                     idx+self.n_burn_in, idx+self.n_burn_in+self.n_sequence)[None,:])
@@ -85,20 +92,25 @@ class ReplayBuffer:
                     b_obs=self.obs_buf[burn_in_idxs],
                     b_obs2=self.obs2_buf[burn_in_idxs],
                     b_act=self.act_buf[burn_in_idxs],
-                    # Shape (1, batch_size, hidden_dim)    
-                    b_h=self.h_buf[burn_in_idxs[:,0]][None,:],
-                    b_c=self.c_buf[burn_in_idxs[:,0]][None,:],
-                    b_h2=self.h2_buf[burn_in_idxs[:,0]][None,:],
-                    b_c2=self.c2_buf[burn_in_idxs[:,0]][None,:]
+                    b_act2=self.act_buf[burn_in_idxs+1],
                     )
+                for net in self.net_names:
+                    batch.update({
+                        # Shape (1, batch_size, hidden_dim)
+                        net+'_b_h':self.hidden_buf[net]['h'][burn_in_idxs[:,0]][None,:],
+                        net+'_b_c':self.hidden_buf[net]['c'][burn_in_idxs[:,0]][None,:],
+                        net+'_b_h2':self.hidden_buf[net]['h2'][burn_in_idxs[:,0]][None,:],
+                        net+'_b_c2':self.hidden_buf[net]['c2'][burn_in_idxs[:,0]][None,:]
+                    })                    
             else:
-                batch.update(
-                    # Shape (1, batch_size, hidden_dim)    
-                    h=self.h_buf[idxs[:,0]][None,:],
-                    c=self.c_buf[idxs[:,0]][None,:],
-                    h2=self.h2_buf[idxs[:,0]][None,:],
-                    c2=self.c2_buf[idxs[:,0]][None,:]
-                )
+                batch.update({
+                        # directly give hidden state
+                        # Shape (1, batch_size, hidden_dim)
+                        net+'_h':self.hidden_buf[net]['h'][idxs[:,0]][None,:],
+                        net+'_c':self.hidden_buf[net]['c'][idxs[:,0]][None,:],
+                        net+'_h2':self.hidden_buf[net]['h2'][idxs[:,0]][None,:],
+                        net+'_c2':self.hidden_buf[net]['c2'][idxs[:,0]][None,:]
+                    })
             batch = {k: torch.as_tensor(
                 v, dtype=torch.float32).to(self.device) 
                 if v is not None else v for k,v in batch.items()}
@@ -257,37 +269,66 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
+    model_names = ['pi', 'q1', 'q2']
     replay_buffer = ReplayBuffer(obs_dim, act_dim, replay_size, recurrent, 
-                                 hidden_dim, n_sequence, n_burn_in, device)
+                                 hidden_dim, n_sequence, n_burn_in, model_names, device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
     logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
 
     def burn_in(data):
-        b_o, b_a, b_o2 = data['b_obs'], data['b_act'],  data['b_obs2']
-        b_h, b_c, b_h2, b_c2 = data['b_h'], data['b_c'], data['b_h2'], data['b_c2']
+        b_o, b_a, b_o2, b_a2 = data['b_obs'], data['b_act'],  data['b_obs2'], data['b_act2']
+        pi_b_h, pi_b_c = data['pi_b_h'], data['pi_b_c']
+        pi_b_h2, pi_b_c2 = data['pi_b_h2'], data['pi_b_c2']
+        q1_b_h, q1_b_c = data['q1_b_h'], data['q1_b_c']
+        q1_b_h2, q1_b_c2 = data['q1_b_h2'], data['q1_b_c2']
+        q2_b_h, q2_b_c = data['q2_b_h'], data['q2_b_c']
+        q2_b_h2, q2_b_c2 = data['q2_b_h2'], data['q2_b_c2']
+            
         with torch.no_grad():
             # return last hidden state
-            _, hidden = ac.pi(b_o, (b_h, b_c))
-            _, hidden_targ = ac_targ.pi(b_o2, (b_h2, b_c2))
-            h, c = hidden
-            h2, c2 = hidden_targ
+            _, pi_hidden = ac.pi(b_o, (pi_b_h, pi_b_c))
+            _, pi_targ_hidden = ac_targ.pi(b_o2, (pi_b_h2, pi_b_c2))
+            pi_h, pi_c = pi_hidden
+            pi_h2, pi_c2 = pi_targ_hidden
+            
+            _, q1_hidden = ac.q1(b_o, b_a, (q1_b_h, q1_b_c))
+            _, q1_targ_hidden = ac.q1(b_o2, b_a2, (q1_b_h2, q1_b_c2))
+            q1_h, q1_c = q1_hidden
+            q1_h2, q1_c2 = q1_targ_hidden
 
-        data['h'], data['c'] = h.detach(), c.detach()
-        data['h2'], data['c2'] = h2.detach(), c2.detach()
+            _, q2_hidden = ac.q2(b_o, b_a, (q2_b_h, q2_b_c))
+            _, q2_targ_hidden = ac.q2(b_o2, b_a2, (q2_b_h2, q2_b_c2))
+            q2_h, q2_c = q2_hidden
+            q2_h2, q2_c2 = q2_targ_hidden
+
+        data['pi_h'], data['pi_c'] = pi_h.detach(), pi_c.detach()
+        data['pi_h2'], data['pi_c2'] = pi_h2.detach(), pi_c2.detach()
+        data['q1_h'], data['q1_c'] = q1_h.detach(), q1_c.detach()
+        data['q1_h2'], data['q1_c2'] = q1_h2.detach(), q1_c2.detach()
+        data['q2_h'], data['q2_c'] = q2_h.detach(), q2_c.detach()
+        data['q2_h2'], data['q2_c2'] = q2_h2.detach(), q2_c2.detach()
+
         return data
 
     # Set up function for computing TD3 Q-losses
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-        h, c, h2, c2 = data['h'], data['c'], data['h2'], data['c2']
-        
-        q1 = ac.q1(o, a, (h, c))
-        q2 = ac.q2(o, a, (h, c))
+        if recurrent:
+            pi_h, pi_c, pi_h2, pi_c2 = data['pi_h'], data['pi_c'], data['pi_h2'], data['pi_c2']
+            q1_h, q1_c, q1_h2, q1_c2 = data['q1_h'], data['q1_c'], data['q1_h2'], data['q1_c2']
+            q2_h, q2_c, q2_h2, q2_c2 = data['q2_h'], data['q2_c'], data['q2_h2'], data['q2_c2']
+        else:
+            pi_h, pi_c, pi_h2, pi_c2 = None, None, None, None
+            q1_h, q1_c, q1_h2, q1_c2 = None, None, None, None
+            q2_h, q2_c, q2_h2, q2_c2 = None, None, None, None
+
+        q1, _ = ac.q1(o, a, (q1_h, q1_c))
+        q2, _ = ac.q2(o, a, (q2_h, q2_c))
         # Bellman backup for Q functions
         with torch.no_grad():
-            pi_targ, _ = ac_targ.pi(o2, (h2, c2))
+            pi_targ, _ = ac_targ.pi(o2, (pi_h2, pi_c2))
 
             # Target policy smoothing
             epsilon = torch.randn_like(pi_targ) * target_noise
@@ -296,8 +337,8 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
             a2 = torch.clamp(a2, -act_limit, act_limit)
 
             # Target Q-values
-            q1_pi_targ = ac_targ.q1(o2, a2, (h2, c2))
-            q2_pi_targ = ac_targ.q2(o2, a2, (h2, c2))
+            q1_pi_targ, _ = ac_targ.q1(o2, a2, (q1_h2, q1_c2))
+            q2_pi_targ, _ = ac_targ.q2(o2, a2, (q2_h2, q2_c2))
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + gamma * (1 - d) * q_pi_targ
 
@@ -314,9 +355,16 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
 
     # Set up function for computing TD3 pi loss
     def compute_loss_pi(data):
-        o, h, c = data['obs'], data['h'], data['c']
-        a, _ = ac.pi(o, (h, c))
-        q1_pi = ac.q1(o, a, (h, c))
+        o = data['obs']
+        if recurrent:
+            pi_h, pi_c = data['pi_h'], data['pi_c']
+            q1_h, q1_c = data['q1_h'], data['q1_c']
+        else:
+            pi_h, pi_c = None, None
+            q1_h, q1_c = None, None
+
+        a, _ = ac.pi(o, (pi_h, pi_c))
+        q1_pi, _ = ac.q1(o, a, (q1_h, q1_c))
         return -q1_pi.mean()
 
     # Set up optimizers for policy and q-function
@@ -369,20 +417,34 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
                     p_targ.data.mul_(polyak)
                     p_targ.data.add_((1 - polyak) * p.data)
 
-    def get_action(o, hidden, noise_scale):
+    def get_action(o, pi_hidden, noise_scale):
+        # Shape (batch_size, step_length, vector_dim)
         o = torch.as_tensor(o, dtype=torch.float32).to(device).unsqueeze(0).unsqueeze(0)
-        a, hidden = ac.act(o, hidden)
+        a, pi_hidden = ac.act(o, pi_hidden)
+        # detach from current graph(memory exceeds limit if graph is not cut)
         a = a.squeeze(0).squeeze(0)
         a += noise_scale * np.random.randn(act_dim)
-        return np.clip(a, -act_limit, act_limit), hidden
+        if pi_hidden is not None:
+            pi_hidden = (pi_hidden[0].detach(), pi_hidden[1].detach())
+        return np.clip(a, -act_limit, act_limit), pi_hidden
+    
+    def get_q_hidden(o, a, q_net, q_hidden):
+        # Shape (batch_size, step_length, vector_dim)
+        o = torch.as_tensor(o, dtype=torch.float32).to(device).unsqueeze(0).unsqueeze(0)
+        a = torch.as_tensor(a, dtype=torch.float32).to(device).unsqueeze(0).unsqueeze(0)
+        _, next_q_hidden = q_net(o, a, q_hidden)
+        # detach from current graph(memory exceeds limit if graph is not cut)
+        if next_q_hidden is not None:
+            next_q_hidden = (next_q_hidden[0].detach(), next_q_hidden[1].detach())
+        return next_q_hidden
 
     def test_agent():
         for j in range(num_test_episodes):
             o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            hidden = ac.get_initialized_hidden()
+            pi_hidden = ac.pi.get_initialized_hidden()
             while not(d or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
-                a, hidden = get_action(o, hidden, 0)
+                a, pi_hidden = get_action(o, pi_hidden, 0)
                 o, r, d, _ = test_env.step(a)
                 ep_ret += r
                 ep_len += 1
@@ -392,7 +454,10 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
-    hidden = ac.get_initialized_hidden()
+    pi_hidden = ac.pi.get_initialized_hidden()
+    q1_hidden = ac.q1.get_initialized_hidden()
+    q2_hidden = ac.q2.get_initialized_hidden()
+
     # Main loop: collect experience in env and update/log each epoch
     for t in range(total_steps):
         
@@ -400,10 +465,14 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
         # from a uniform distribution for better exploration. Afterwards, 
         # use the learned policy (with some noise, via act_noise). 
         if t > start_steps:
-            a, next_hidden = get_action(o, hidden, act_noise)
+            a, next_pi_hidden = get_action(o, pi_hidden, act_noise)
+            next_q1_hidden = get_q_hidden(o, a, ac.q1, q1_hidden)
+            next_q2_hidden = get_q_hidden(o, a, ac.q1, q2_hidden)
         else:
             a = env.action_space.sample()
-            _, next_hidden = get_action(o, hidden, act_noise)
+            _, next_pi_hidden = get_action(o, pi_hidden, act_noise)
+            next_q1_hidden = get_q_hidden(o, a, ac.q1, q1_hidden)
+            next_q2_hidden = get_q_hidden(o, a, ac.q2, q2_hidden)
 
         # Step the env
         o2, r, d, _ = env.step(a)
@@ -416,12 +485,16 @@ def td3(env_fn, actor_critic=core.ActorCritic, ac_kwargs=dict(), seed=0,
         d = False if ep_len==max_ep_len else d
 
         # Store experience to replay buffer
+        hidden = {'pi':pi_hidden, 'q1':q1_hidden, 'q2':q2_hidden}
+        next_hidden = {'pi':next_pi_hidden, 'q1':next_q1_hidden, 'q2':next_q2_hidden}
         replay_buffer.store(o, a, r, o2, d, hidden, next_hidden)
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!
         o = o2
-        hidden = next_hidden
+        pi_hidden = next_pi_hidden
+        q1_hidden = next_q1_hidden
+        q2_hidden = next_q2_hidden
 
         # End of trajectory handling
         if d or (ep_len == max_ep_len):
